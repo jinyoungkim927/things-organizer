@@ -36,6 +36,9 @@ LOG_FILE = LOG_DIR / f"organize_{datetime.now().strftime('%Y-%m-%d')}.log"
 LOCK_FILE = SCRIPT_DIR / ".lock"
 STATE_FILE = SCRIPT_DIR / ".task_state.json"
 COOLDOWN_SECONDS = 30
+# Merging completes the absorbed tasks, and the model merges tasks that are only
+# related ("reply to michelle" into "Reply to eddie morgan"). Off: merges are logged, not applied.
+AUTO_MERGE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -223,7 +226,16 @@ def analyze_new_and_changed(new_tasks: list[dict], changed_tasks: list[dict],
 
 {existing_text}
 
-You have TWO jobs, but ONLY for the tasks marked [NEW] or [EDITED]:
+You have TWO jobs, but ONLY for the tasks marked [NEW] or [EDITED].
+
+## OVERRIDING RULE: LEAVE GIBBERISH ALONE
+Before applying either job, ask: "Is this task name actually intelligible enough that I can tell what the user meant?"
+
+If a task name is genuinely unclear — random characters, half-finished fragments, personal shorthand whose meaning isn't obvious, typed-on-phone keysmash, or any string where you'd have to *guess* at intent — DO NOT rephrase it and DO NOT merge it. Omit it from "renames" entirely and never list it as a child in "groups". Leave the original text exactly as the user wrote it so they can clarify it later themselves.
+
+Better to leave a confusing task visible and untouched than to invent a meaning that wasn't there. When uncertain whether something is gibberish vs. just messy, default to leaving it alone.
+
+Only proceed with the jobs below if you can confidently tell what the task means.
 
 ## JOB 1: REPHRASE task names (only for [NEW] and [EDITED] tasks)
 Rewrite each new/edited task name to be concise, clear, and well-phrased:
@@ -234,6 +246,7 @@ Rewrite each new/edited task name to be concise, clear, and well-phrased:
 - Make it scannable — a busy person should instantly understand what to do
 - Keep it punchy and natural, not corporate-speak
 - If a task name is already clean and concise, keep it as-is
+- If you can't confidently tell what the task means (see overriding rule above), leave it alone
 
 ## JOB 2: CHECK FOR GROUPING (merge new tasks into existing if they overlap)
 - Check if any [NEW]/[EDITED] task clearly overlaps with or duplicates an EXISTING task
@@ -266,16 +279,27 @@ Respond with a JSON object (no markdown fencing):
 "renames" should only include [NEW]/[EDITED] tasks that are NOT being merged as children. If a task is being merged (appears in child_ids), don't include it in renames."""
 
     # Use Haiku for small diffs (1-2 tasks), Sonnet for larger ones
-    model = "claude-haiku-4-5-20251001" if len(targets) <= 2 else "claude-sonnet-4-20250514"
+    if len(targets) <= 2:
+        model, extra = "claude-haiku-4-5-20251001", {}
+    else:
+        # Sonnet 5.5 thinks by default; low effort skips it on simple requests like this one
+        model, extra = "claude-sonnet-5-5", {"output_config": {"effort": "low"}}
     log.info(f"Using {model} for {len(targets)} task(s) to process")
 
     response = client.messages.create(
         model=model,
-        max_tokens=4096,
+        max_tokens=16000,  # room for any thinking plus the JSON reply
         messages=[{"role": "user", "content": prompt}],
+        **extra,
     )
 
-    text = response.content[0].text.strip()
+    if response.stop_reason == "refusal":
+        details = getattr(response, "stop_details", None)  # not typed in anthropic 0.84
+        category = getattr(details, "category", None) if details else None
+        raise RuntimeError(f"{model} declined the request (category: {category})")
+
+    # The response may start with a thinking block, so take the text block
+    text = next(b.text for b in response.content if b.type == "text").strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1]
         if text.endswith("```"):
@@ -301,11 +325,16 @@ def apply_changes(all_tasks: list[dict], plan: dict, dry_run: bool = False):
             continue
 
         parent = task_map[parent_id]
-        children = [task_map[cid] for cid in child_ids if cid in task_map]
+        children = [task_map[cid] for cid in child_ids if cid in task_map and cid != parent_id]
         if not children:
             continue
 
         child_names = [c["name"] for c in children]
+        if not AUTO_MERGE:
+            log.info(f"SUGGESTED MERGE (not applied): '{parent['name']}' + {child_names}")
+            log.info(f"  Reason: {group.get('reasoning', 'N/A')}")
+            continue
+
         log.info(f"MERGE: '{parent['name']}' absorbs {child_names}")
         log.info(f"  Reason: {group.get('reasoning', 'N/A')}")
 
@@ -337,7 +366,7 @@ def apply_changes(all_tasks: list[dict], plan: dict, dry_run: bool = False):
         if not dry_run:
             set_task_name(rid, new_name)
 
-    groups = len(plan.get("groups", []))
+    groups = len(plan.get("groups", [])) if AUTO_MERGE else 0
     renames = len(plan.get("renames", []))
     log.info(f"Applied {groups} merges, {renames} renames")
 
